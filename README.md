@@ -32,8 +32,18 @@ pipx install repokg        # or: pip install repokg
 pipx install git+https://github.com/NehharShah/repokg
 ```
 
-Requirements: Python ≥ 3.9, `git`. Optional: [`gh`](https://cli.github.com) (logged
-in) for the PR/branch cross-reference — without it the knowledge graph still builds, minus PR data.
+Requirements: Python ≥ 3.9, `git`. Optional, for the PR/branch cross-reference —
+without it the knowledge graph still builds, minus PR data. The provider is
+auto-detected from the `origin` remote URL (override with `--provider`):
+
+| Host | Provider | Needs |
+|---|---|---|
+| GitHub (default, incl. Enterprise) | `github` | [`gh`](https://cli.github.com), logged in |
+| GitLab (gitlab.com or self-hosted) | `gitlab` | [`glab`](https://gitlab.com/gitlab-org/cli), logged in |
+| Bitbucket Cloud | `bitbucket` | nothing for public repos; `BITBUCKET_TOKEN` (repository/workspace access token) for private ones |
+
+Bitbucket's PR list has no merge timestamp, so merged/closed dates come from the
+PR's last-updated time.
 
 ## Usage
 
@@ -58,6 +68,30 @@ The agent explores the code, writes `.repokg/narratives.json`, and runs
 `repokg render` — KNOWLEDGE_GRAPH.md now carries verified purposes, data flows,
 timeline eras, and gotchas alongside the deterministic structure.
 
+### The enrichment loop
+
+Enrichment is not a one-off. Structure refreshes on every scan, but a purpose line
+written by an agent stays frozen while the module under it is rewritten. repokg tracks
+that, so every run after the first re-verifies only what moved:
+
+```
+repokg generate .            # scan, write the prompt, render (stamps each enriched module)
+  agent: follow .repokg/prompts/enrich.md      # first run: full enrichment
+  ... code changes ...
+repokg check .               # narrative stale: lib (3 of 5 files changed since enrichment)
+  agent: follow .repokg/prompts/enrich.md      # re-run: only the flagged modules
+repokg render . --restamp lib                  # for each flagged module whose line still holds
+repokg check .               # fresh
+```
+
+On a re-run (`.repokg/narratives.json` already exists) the prompt tells the agent to take
+the flagged modules from `repokg check` or `repokg audit --json`, re-read only those,
+rewrite a purpose line that is now wrong, and `--restamp` the ones that still hold. A
+rewritten line is re-stamped by the render itself. Modules that were not flagged are
+neither re-read nor re-worded. The prompt also forbids `--restamp` on a module the agent
+has not re-read, since the stamp is the claim "verified against the current code". Details
+of the fingerprints, the threshold and `--restamp` are under [Honesty layer](#honesty-layer).
+
 ### Commands
 
 | Command | Effect |
@@ -69,13 +103,13 @@ timeline eras, and gotchas alongside the deterministic structure.
 | `repokg inject [path]` | Wire the knowledge graph into `CLAUDE.md` / `AGENTS.md` / Cursor rules (`--diff` for dry run) |
 | `repokg audit [path]` | Show every *inferred* conclusion with confidence + evidence (`--json` for machines) |
 | `repokg clean [path]` | Remove everything repokg authored — never touches your content (`--diff` for dry run) |
-| `repokg check [path]` | Exit 1 if the knowledge graph is stale vs `HEAD` (CI-friendly) |
+| `repokg check [path]` | Exit 1 if the knowledge graph is stale vs `HEAD`, or an enriched module's narrative has drifted from its code (CI-friendly) |
 | `repokg diff [path]` | Report what changed between two graphs; exit 1 if the shape changed |
 
 Flags: `--out DIR` (default `<repo>/.repokg`), `--md FILE` (default `<repo>/KNOWLEDGE_GRAPH.md`),
-`--exclude PATTERN` (repeatable), `--no-github`, `--no-cache`, `--pr-limit N`, `--diff`, `--json`,
+`--exclude PATTERN` (repeatable), `--no-github` (skip the PR lookup, whichever provider), `--provider auto|github|gitlab|bitbucket`, `--no-cache`, `--pr-limit N`, `--diff`, `--json`,
 `--from KG.JSON`, `--to KG.JSON`, `--from-ref REF`, `--to-ref REF`,
-`--format text|json|md`, `--no-renames`.
+`--format text|json|md`, `--no-renames`, `--stale-threshold PERCENT`, `--restamp MODULE`.
 
 ### Structural diff
 
@@ -274,6 +308,28 @@ be turned off with `--no-renames`.
 
 Agent-written `narratives.json` is schema-validated before rendering — malformed
 enrichment fails loudly with errors precise enough for the agent to self-correct.
+On render, each enriched module is also stamped with a content fingerprint (its code
+files' git blob shas) in `.repokg/narratives.lock.json`, so a later check can tell when a
+purpose line has outlived the code it describes. The lock is machine-written, kept apart
+from `narratives.json`, and removed by `repokg clean`; re-rendering keeps a module's stamp
+unless its narrative text changed.
+
+`repokg check` reads that lock as a second dimension next to "is the graph at `HEAD`":
+
+```
+$ repokg check .
+narrative stale: internal/hedging/risk (12 of 40 files changed since enrichment)
+re-verify the flagged modules, then `repokg render --restamp MODULE` for each one that still holds
+```
+
+A module is flagged when more than `--stale-threshold PERCENT` of its files were edited,
+added or removed since its stamp (default `0`: any change; uncommitted edits count).
+Untouched modules stay green. When you re-read a flagged module and its purpose line still
+holds, `repokg render --restamp internal/hedging/risk` (repeatable) re-baselines it without
+rewording anything; naming a module with no narrative is an error. Stale narratives also show
+up in `repokg audit` as `narrative` findings, with the changed files as evidence. If
+`narratives.json` exists but no lock does, `check` says so rather than reporting the
+narratives fresh.
 (Findings/confidence design inspired by [RepoCanon](https://github.com/NehharShah/repocanon).)
 
 ## Agent integration
@@ -313,6 +369,11 @@ following step can react without re-running anything:
 The action installs repokg from its own checkout rather than from PyPI, so
 `@v0.4.5` runs repokg 0.4.5 by construction — there is no second version to
 keep in sync and no way for the two to drift apart.
+
+In check mode a drifted narrative fails the step like a stale graph does, and the
+message says which fix applies: `repokg generate` for a graph behind `HEAD`, re-verify
+and `repokg render --restamp MODULE` for a stale narrative. The narrative half needs
+`.repokg/narratives.lock.json` to be committed along with the graph.
 
 **Check mode needs a committed graph.** It compares the `HEAD` recorded in
 `.repokg/kg.json` against the actual `HEAD`, so a repo that gitignores
@@ -395,8 +456,8 @@ on the knowledge graph discovers your rules — and vice versa.
 
 | Area | How |
 |---|---|
-| Branch classification | `git for-each-ref` + `--merged` ancestry vs the integration branch (auto-detects `staging`/`develop`), cross-referenced with every PR's head ref via `gh` — distinguishes true merges from squash-merges from abandoned work |
-| PR catalog | `gh pr list --state all` — open / merged / closed-unmerged, full appendix table |
+| Branch classification | `git for-each-ref` + `--merged` ancestry vs the integration branch (auto-detects `staging`/`develop`), cross-referenced with every PR/MR's head ref via the PR provider (`gh`, `glab`, or the Bitbucket API) — distinguishes true merges from squash-merges from abandoned work |
+| PR catalog | `gh pr list --state all` (GitHub), `glab api` merge requests (GitLab) or the Bitbucket REST API — open / merged / closed-unmerged, full appendix table |
 | Module inventory | Filesystem walk with LOC per directory, language detection, generated-code flagging |
 | Import graph | Go: `import` blocks resolved against `go.mod` module paths · Python: stdlib `ast` incl. relative imports · JS/TS: `import`/`require` resolution — relative paths, tsconfig/jsconfig `paths` + `baseUrl` aliases (nearest config wins), npm/yarn/pnpm workspace package names · Rust: `use` declarations resolved against Cargo crate names (cross-crate) and `src/` module trees (intra-crate) · Java/Kotlin: imports resolved by longest prefix against `package` declarations. Directory→directory edges with counts |
 | Ops surface | CI workflow names, Dockerfiles, compose files, Helm charts, Makefile targets, config/docs/test/migration dirs |
